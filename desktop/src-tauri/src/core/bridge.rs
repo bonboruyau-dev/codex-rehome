@@ -383,8 +383,12 @@ fn apply_bridge_plan_with_lock_token(
             &history_modes,
             lock_token,
         );
-        on_applied(&operation.target)?;
+        // Record the mutation only after the SQLite transaction has committed.
+        // Recording it on an error made rollback treat an untouched database as
+        // partially applied, which is especially dangerous when SQLite created
+        // a fresh WAL sidecar during the failed attempt.
         sqlite_threads_imported = import_result?;
+        on_applied(&operation.target)?;
     }
 
     Ok(BridgeApplyReport {

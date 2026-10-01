@@ -1386,7 +1386,11 @@ fn tasklist_csv_has_process(output: &str, process_name: &str) -> bool {
 #[cfg(target_os = "macos")]
 fn codex_desktop_is_running() -> Result<bool, RehomeError> {
     let output = Command::new("pgrep")
-        .args(["-f", "/Codex.app/"])
+        // The current macOS desktop app can be shipped as either Codex.app or
+        // ChatGPT.app. Checking only Codex.app allowed ChatGPT's background
+        // process to keep SQLite/WAL handles open during restore or rollback.
+        // That produced stale in-memory state overwrites and rollback conflicts.
+        .args(["-f", "/(Codex|ChatGPT)\\.app/"])
         .output()
         .map_err(|error| {
             RehomeError::new(
