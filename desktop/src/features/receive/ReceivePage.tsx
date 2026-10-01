@@ -1,4 +1,5 @@
-import { useRef, useState, type RefObject } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -33,6 +34,7 @@ import {
   type RestoreLocationSelection,
   type RestorePlan,
   type RestoreReport,
+  type RestoreProgress,
 } from "../../lib/types";
 
 interface ReceivePageProps {
@@ -68,11 +70,26 @@ export default function ReceivePage({
   const [conflictResolution, setConflictResolution] = useState<FileConflictResolution | null>(null);
   const [codexClosed, setCodexClosed] = useState(false);
   const [report, setReport] = useState<RestoreReport | null>(null);
+  const [restoreProgress, setRestoreProgress] = useState<RestoreProgress | null>(null);
   const [phase, setPhase] = useState<"idle" | "inspecting" | "selecting" | "planning" | "restoring">("idle");
   const [error, setError] = useState<string | null>(null);
   const [supportId, setSupportId] = useState<string | null>(null);
   const [registrationStatuses, setRegistrationStatuses] = useState<Record<string, string>>({});
   const requestGeneration = useRef(0);
+  const phaseStartedAtMs = useRef<number | null>(null);
+  const lastProgressPhase = useRef<RestoreProgress["phase"] | null>(null);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<RestoreProgress>("restore-progress", ({ payload }) => {
+      if (lastProgressPhase.current !== payload.phase) {
+        phaseStartedAtMs.current = payload.elapsed_ms;
+      }
+      lastProgressPhase.current = payload.phase;
+      setRestoreProgress(payload);
+    }).then((stop) => { unlisten = stop; });
+    return () => unlisten?.();
+  }, []);
 
   async function choosePackage() {
     if (phase !== "idle") return;
@@ -171,6 +188,9 @@ export default function ReceivePage({
     if (!plan || plan.conflict_count > 0 || !codexClosed) return;
     setError(null);
     setSupportId(null);
+    setRestoreProgress(null);
+    phaseStartedAtMs.current = null;
+    lastProgressPhase.current = null;
     setPhase("restoring");
     onOperationStart();
     try {
@@ -294,6 +314,7 @@ export default function ReceivePage({
           )}
           <label className="confirmation-row"><input type="checkbox" checked={codexClosed} onChange={(event) => setCodexClosed(event.target.checked)} aria-label={t("确认已保存当前 Codex 工作")} /><span><strong>{t("当前 Codex 工作已保存")}</strong><small>{t("导入完成后请退出并重新打开 Codex，以加载迁移内容。")}</small></span></label>
           <div className="command-row"><ProgressSteps active={phase === "restoring"} complete={Boolean(report)} /><button className="command-button danger-command" type="button" disabled={!canRestore} onClick={() => void handleRestore()}>{phase === "restoring" ? <LoaderCircle className="spin" aria-hidden="true" /> : <Play aria-hidden="true" />}{t(phase === "restoring" ? "正在导入" : "导入到 Codex")}</button></div>
+          {phase === "restoring" && restoreProgress && <RestoreProgressPanel progress={restoreProgress} phaseStartedAtMs={phaseStartedAtMs.current} />}
         </section>
       )}
 
@@ -309,6 +330,7 @@ export default function ReceivePage({
               return <span key={key} className={passed ? "verification-pass" : "verification-fail"}>{passed ? <CheckCircle2 aria-hidden="true" /> : <AlertTriangle aria-hidden="true" />}{t(key === "app_visible_ready" && !passed ? "对话可见性待确认" : label)}</span>;
             })}
           </div>
+          {restoreProgress?.phase === "completed" && <p className="restore-completion-facts">{t("本次导入耗时 {time}，写入 {bytes}，处理 {files} 个文件。", { time: formatDuration(restoreProgress.elapsed_ms / 1000), bytes: formatBytes(report.restored_bytes), files: report.restored_files })}</p>}
           {!report.verification.app_visible_ready && <p className="manual-status" role="status"><AlertTriangle aria-hidden="true" />{t("文件和索引已导入。请重启 Codex，打开原对话并继续发送一条消息，确认可以使用。")}</p>}
           {manualRegistration && <p className="manual-status" role="status"><AlertTriangle aria-hidden="true" />{t("项目文件已导入，需要在 Codex 中手动打开")}</p>}
           {report.registrations.map((registration) => {
@@ -384,6 +406,39 @@ function ProgressSteps({ active, complete }: { active: boolean; complete: boolea
   return <div className="progress-steps" aria-label={t("导入进度")}>{labels.map((label, index) => <span key={label} className={complete ? "complete" : active && index < 2 ? "active" : ""}>{complete ? <CheckCircle2 aria-hidden="true" /> : <Circle aria-hidden="true" />}{t(label)}</span>)}</div>;
 }
 
+function RestoreProgressPanel({ progress, phaseStartedAtMs }: { progress: RestoreProgress; phaseStartedAtMs: number | null }) {
+  const { t } = useI18n();
+  const phaseLabels: Record<RestoreProgress["phase"], string> = {
+    checking_package: "正在复核迁移包",
+    preparing_backup: "正在创建安全备份",
+    restoring_files: "正在复制文件",
+    updating_index: "正在更新会话索引和数据库",
+    verifying: "正在检查导入结果",
+    completed: "导入完成",
+    rolled_back: "已恢复到导入前状态",
+    rollback_failed: "自动回滚未完成",
+  };
+  const isCopying = progress.phase === "restoring_files" && progress.total_bytes > 0;
+  const ratio = isCopying ? Math.min(1, progress.completed_bytes / progress.total_bytes) : null;
+  const elapsedSeconds = phaseStartedAtMs === null ? 0 : Math.max(0, (progress.elapsed_ms - phaseStartedAtMs) / 1000);
+  const remainingSeconds = isCopying && progress.completed_bytes >= 32 * 1024 * 1024 && elapsedSeconds >= 8
+    ? (progress.total_bytes - progress.completed_bytes) / (progress.completed_bytes / elapsedSeconds)
+    : null;
+  return (
+    <div className="restore-progress-panel" role="status" aria-live="polite">
+      <div className="restore-progress-heading"><strong>{t(phaseLabels[progress.phase])}</strong><span>{isCopying ? `${Math.round((ratio ?? 0) * 100)}%` : t("阶段进行中")}</span></div>
+      <progress max={100} value={ratio === null ? undefined : ratio * 100} aria-label={t("导入进度")} />
+      <div className="restore-progress-details">
+        {isCopying
+          ? <span>{t("已处理 {done} / {total}", { done: formatBytes(progress.completed_bytes), total: formatBytes(progress.total_bytes) })} · {t("{done} / {total} 个文件", { done: progress.completed_files, total: progress.total_files })}</span>
+          : <span>{t("阶段已运行 {time}", { time: formatDuration(elapsedSeconds) })}</span>}
+        <span>{remainingSeconds === null ? t("正在估算剩余时间") : t("当前阶段预计还需 {time}", { time: formatDuration(remainingSeconds) })}</span>
+      </div>
+      <small>{t("请保持 ReHome 打开；大文件或数据库处理时进度可能暂时不变化。")}</small>
+    </div>
+  );
+}
+
 function sourceOsLabel(os: "windows" | "macos"): string {
   return os === "macos" ? "macOS" : "Windows";
 }
@@ -401,6 +456,14 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatDuration(seconds: number): string {
+  const total = Math.max(0, Math.ceil(seconds));
+  if (total < 60) return `${total} 秒`;
+  const minutes = Math.floor(total / 60);
+  const remainder = total % 60;
+  return remainder ? `${minutes} 分 ${remainder} 秒` : `${minutes} 分钟`;
 }
 
 function registrationStatusMessage(status: RegistrationStatus, t: (key: string) => string): string {

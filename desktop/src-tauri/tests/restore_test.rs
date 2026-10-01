@@ -106,6 +106,76 @@ fn support_survives_restart_and_checks_only_its_real_transaction() -> Result<(),
 }
 
 #[test]
+fn restore_progress_reports_real_copy_bytes_and_lifecycle_phases() -> Result<(), Box<dyn Error>> {
+    use rehome_desktop_lib::core::restore::{apply_restore_by_id_with_progress, RestoreProgress};
+    let harness = RestoreHarness::new(DatabaseSchema::Compatible)?;
+    let mut progress: Vec<RestoreProgress> = Vec::new();
+    let mut transaction_states = Vec::new();
+    let report = apply_restore_by_id_with_progress(
+        harness.plan.plan_id,
+        harness.options(),
+        |id, status| transaction_states.push((id, status)),
+        |event| progress.push(event),
+    )?;
+
+    let phases = progress
+        .iter()
+        .map(|event| event.phase.as_str())
+        .collect::<Vec<_>>();
+    for phase in [
+        "checking_package",
+        "preparing_backup",
+        "restoring_files",
+        "updating_index",
+        "verifying",
+        "completed",
+    ] {
+        assert!(phases.contains(&phase), "missing phase {phase}: {phases:?}");
+    }
+    let copy_events = progress
+        .iter()
+        .filter(|event| event.phase == "restoring_files")
+        .collect::<Vec<_>>();
+    assert!(
+        copy_events.len() >= 2,
+        "expected start and completed file progress: {copy_events:?}"
+    );
+    assert!(copy_events.iter().all(|event| event.total_bytes > 0));
+    assert!(copy_events
+        .windows(2)
+        .all(|pair| pair[0].completed_bytes <= pair[1].completed_bytes));
+    let last_copy = copy_events.last().unwrap();
+    assert_eq!(last_copy.completed_bytes, last_copy.total_bytes);
+    assert_eq!(last_copy.completed_files, last_copy.total_files);
+    assert_eq!(
+        transaction_states,
+        vec![
+            (report.transaction_id, RecoveryStatus::Prepared),
+            (report.transaction_id, RecoveryStatus::Committed),
+        ]
+    );
+    assert_eq!(progress.last().unwrap().phase, "completed");
+    Ok(())
+}
+
+#[test]
+fn restore_progress_reports_automatic_rollback_after_failure() -> Result<(), Box<dyn Error>> {
+    use rehome_desktop_lib::core::restore::{apply_restore_by_id_with_progress, RestoreProgress};
+    let harness = RestoreHarness::new(DatabaseSchema::RequiredColumnWithoutDefault)?;
+    let mut progress: Vec<RestoreProgress> = Vec::new();
+    let error = apply_restore_by_id_with_progress(
+        harness.plan.plan_id,
+        harness.options(),
+        |_, _| {},
+        |event| progress.push(event),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RestoreFailed);
+    assert_eq!(progress.last().unwrap().phase, "rolled_back");
+    Ok(())
+}
+
+#[test]
 fn support_observer_identifies_the_rolled_back_attempt() -> Result<(), Box<dyn Error>> {
     use rehome_desktop_lib::core::restore::apply_restore_by_id_observed;
     let harness = RestoreHarness::new(DatabaseSchema::RequiredColumnWithoutDefault)?;
@@ -498,6 +568,54 @@ fn replacing_a_conflicting_project_file_is_backed_up_and_rollback_safe(
     let rollback_report = rollback(report.transaction_id)?;
     assert!(rollback_report.restored_files > 0);
     assert_eq!(fs::read(target_path)?, local_contents);
+    Ok(())
+}
+
+#[test]
+fn keeping_a_conflicting_project_file_verifies_its_planned_local_hash() -> Result<(), Box<dyn Error>>
+{
+    let harness = RestoreHarness::new(DatabaseSchema::Compatible)?;
+    let project_operation = harness
+        .plan
+        .operations
+        .iter()
+        .find(|operation| {
+            operation.package_source.starts_with("projects/")
+                && operation.package_source.ends_with("README.md")
+        })
+        .ok_or("fixture project README operation is missing")?;
+    let target_path = project_operation.target.clone();
+    fs::create_dir_all(target_path.parent().ok_or("project target has no parent")?)?;
+    let local_contents = b"# Keep this local version during import\n";
+    fs::write(&target_path, local_contents)?;
+
+    let preview = inspect_package(&harness.plan.package_path)?;
+    let target = TargetInventory {
+        codex_home: harness.plan.target_codex_home.clone(),
+        target_os: current_source_os(),
+        target_arch: "x86_64".into(),
+        counts: ContentCounts::default(),
+        projects: vec![],
+        conversations: vec![],
+    };
+    let plan = build_restore_plan_with_conflict_resolution(
+        &preview,
+        &target,
+        &harness.plan.projects_root,
+        Some(FileConflictResolution::KeepExisting),
+    )?;
+    let preserved = plan
+        .operations
+        .iter()
+        .find(|operation| operation.target == target_path)
+        .ok_or("resolved project operation is missing")?;
+    assert_eq!(preserved.action, ChangeKind::Preserve);
+    assert!(!preserved.rollback_required);
+
+    let report = apply_restore(plan, harness.options())?;
+    assert!(report.verification.project_files_valid);
+    assert_eq!(fs::read(&target_path)?, local_contents);
+    assert_eq!(harness.single_journal_status()?, RecoveryStatus::Committed);
     Ok(())
 }
 

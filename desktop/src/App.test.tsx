@@ -22,8 +22,14 @@ const updater = vi.hoisted(() => ({
   installCheckedUpdate: vi.fn(),
 }));
 
+const tauriEvents = vi.hoisted(() => ({
+  listen: vi.fn(),
+  handlers: [] as Array<(event: { payload: Record<string, unknown> }) => void>,
+}));
+
 vi.mock("./lib/api", () => api);
 vi.mock("./lib/updater", () => updater);
+vi.mock("@tauri-apps/api/event", () => ({ listen: tauriEvents.listen }));
 
 const inventory = {
   codex_home: "C:\\Users\\Me\\.codex",
@@ -213,6 +219,11 @@ const committedTransaction = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  tauriEvents.handlers.length = 0;
+  tauriEvents.listen.mockImplementation(async (_event: string, handler: (event: { payload: Record<string, unknown> }) => void) => {
+    tauriEvents.handlers.push(handler);
+    return vi.fn();
+  });
   window.localStorage.clear();
   api.discoverCodex.mockResolvedValue(inventory);
   api.listTransactions.mockResolvedValue({ transactions: [], warnings: [] });
@@ -400,6 +411,46 @@ describe("ReHome Desktop workflows", () => {
 
     expect(selectAll).not.toBeChecked();
     expect(screen.getByRole("button", { name: "创建迁移包" })).toBeDisabled();
+  });
+
+  it("packages all safe content in one click while keeping conversations from an unsafe home project", async () => {
+    const user = userEvent.setup();
+    const homeProject = {
+      ...inventory.projects[0],
+      project_id: "51515151-5151-4515-8515-515151515151",
+      name: "Me",
+      source_path: "C:\\Users\\Me",
+    };
+    const homeConversation = {
+      ...inventory.conversations[0],
+      task_id: "61616161-6161-4616-8616-616161616161",
+      project_id: homeProject.project_id,
+      title: "Home workflow",
+    };
+    api.discoverCodex.mockResolvedValue({
+      ...inventory,
+      projects: [...inventory.projects, homeProject],
+      project_paths: [...inventory.project_paths, homeProject.source_path],
+      conversations: [...inventory.conversations, homeConversation],
+    });
+
+    render(<App />);
+    await screen.findByText(inventory.codex_home);
+    await user.click(screen.getByRole("button", { name: "前往导出" }));
+
+    expect(screen.getByRole("checkbox", { name: "选择项目 Me" })).toBeDisabled();
+    expect(screen.getByText("项目目录覆盖 Codex 数据目录；为避免递归打包和凭据暴露，只迁移下面的对话")).toBeVisible();
+    expect(screen.getByText("已跳过 1 个覆盖 Codex 数据目录的过宽项目；项目文件不打包，但其对话仍会迁移。")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "一键打包全部" }));
+
+    expect(api.createPackage).toHaveBeenCalledWith({
+      project_ids: inventory.projects.map((project) => project.project_id),
+      conversation_ids: [...inventory.conversations, homeConversation].map((conversation) => conversation.task_id),
+      skill_ids: inventory.skills.map((skill) => skill.content_id),
+      plugin_ids: inventory.plugins.map((plugin) => plugin.content_id),
+      generated_image_ids: inventory.generated_images.map((image) => image.content_id),
+    });
   });
 
   it("keeps conversations selectable when a registered project folder was deleted", async () => {
@@ -889,6 +940,60 @@ describe("ReHome Desktop workflows", () => {
     await user.click(screen.getByRole("checkbox", { name: "确认已保存当前 Codex 工作" }));
     await user.click(screen.getByRole("button", { name: "导入到 Codex" }));
     expect(api.applyRestore).toHaveBeenLastCalledWith("fresh-plan", expect.any(Object));
+  });
+
+  it("shows measured copy progress and a phase-specific remaining-time estimate", async () => {
+    const user = userEvent.setup();
+    const pending = deferred<Awaited<ReturnType<typeof api.applyRestore>>>();
+    api.applyRestore.mockReturnValue(pending.promise);
+    render(<App />);
+    await screen.findByText(inventory.codex_home);
+    await openReceive(user);
+    await user.click(screen.getByRole("checkbox", { name: "确认已保存当前 Codex 工作" }));
+    await user.click(screen.getByRole("button", { name: "导入到 Codex" }));
+
+    await act(async () => {
+      tauriEvents.handlers.forEach((handler) => handler({ payload: {
+        transaction_id: committedTransaction.transaction_id,
+        phase: "restoring_files",
+        completed_bytes: 0,
+        total_bytes: 128 * 1024 * 1024,
+        completed_files: 0,
+        total_files: 2,
+        elapsed_ms: 1000,
+      } }));
+    });
+    await act(async () => {
+      tauriEvents.handlers.forEach((handler) => handler({ payload: {
+        transaction_id: committedTransaction.transaction_id,
+        phase: "restoring_files",
+        completed_bytes: 64 * 1024 * 1024,
+        total_bytes: 128 * 1024 * 1024,
+        completed_files: 1,
+        total_files: 2,
+        elapsed_ms: 9000,
+      } }));
+    });
+
+    expect(screen.getByText("正在复制文件")).toBeVisible();
+    expect(screen.getByText("50%")).toBeVisible();
+    expect(screen.getByText(/64\.0 MB \/ 128\.0 MB/)).toBeVisible();
+    expect(screen.getByText(/1 \/ 2 个文件/)).toBeVisible();
+    expect(screen.getByText("当前阶段预计还需 8 秒")).toBeVisible();
+    pending.resolve({
+      transaction_id: committedTransaction.transaction_id,
+      package_id: preview.manifest.package_id,
+      completed_at: "2026-07-23T09:05:00Z",
+      restored_files: 2,
+      restored_bytes: 128 * 1024 * 1024,
+      registrations: [],
+      verification: {
+        package_checksum_valid: true, files_valid: true, sessions_valid: true,
+        session_index_valid: true, sqlite_threads_valid: true, path_mapping_valid: true,
+        forbidden_files_absent: true, project_files_valid: true,
+        app_registration_valid: true, app_visible_ready: true,
+      },
+    });
   });
 
   it("keeps conversation visibility unverified after successful project registration", async () => {

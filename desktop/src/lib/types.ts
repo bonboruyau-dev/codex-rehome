@@ -187,6 +187,16 @@ export interface RestoreOptions {
   register_projects: boolean;
 }
 
+export interface RestoreProgress {
+  transaction_id: string | null;
+  phase: "checking_package" | "preparing_backup" | "restoring_files" | "updating_index" | "verifying" | "completed" | "rolled_back" | "rollback_failed";
+  completed_bytes: number;
+  total_bytes: number;
+  completed_files: number;
+  total_files: number;
+  elapsed_ms: number;
+}
+
 export interface RestoreLocationSelection {
   selection_id: string;
   target_codex_home: string;

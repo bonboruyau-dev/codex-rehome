@@ -15,8 +15,9 @@ use crate::core::{
     },
     planner::build_restore_plan_with_conflict_resolution as core_build_restore_plan,
     restore::{
-        apply_restore_by_id_observed, list_transaction_history as core_list_transaction_history,
-        rollback as core_rollback, transaction_summary as core_transaction_summary,
+        apply_restore_by_id_with_progress,
+        list_transaction_history as core_list_transaction_history, rollback as core_rollback,
+        transaction_summary as core_transaction_summary,
     },
 };
 use crate::support::{self, models::*, SupportService};
@@ -29,7 +30,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, State, WebviewWindow};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::{DialogExt, FilePath};
 use tauri_plugin_opener::OpenerExt;
@@ -626,11 +627,13 @@ pub async fn build_restore_plan(
 
 #[tauri::command]
 pub async fn apply_restore(
+    app: AppHandle,
     state: State<'_, WorkflowState>,
     selection: ApplyRestoreSelection,
 ) -> Result<RestoreReport, SupportFailure> {
     let state = state.inner().clone();
     run_supported(Stage::Apply, state.support.clone(), move |snapshot| {
+        let app = app.clone();
         let claim = state.claim_plan(selection.plan_id)?;
         if let Some((source_os, schema, counts)) = &claim.package_facts {
             snapshot.source_os = Some(*source_os);
@@ -640,7 +643,7 @@ pub async fn apply_restore(
         if let Ok(plan) = crate::core::plan_store::load(selection.plan_id) {
             support::capture_plan(snapshot, &plan);
         }
-        let result = apply_restore_by_id_observed(
+        let result = apply_restore_by_id_with_progress(
             selection.plan_id,
             RestoreOptions {
                 codex_closed_confirmed: selection.codex_closed_confirmed,
@@ -650,6 +653,9 @@ pub async fn apply_restore(
             |id, status| {
                 snapshot.transaction_id = Some(id);
                 snapshot.transaction_status = Some(status);
+            },
+            |progress| {
+                let _ = app.emit("restore-progress", &progress);
             },
         );
         if let Ok(report) = &result {

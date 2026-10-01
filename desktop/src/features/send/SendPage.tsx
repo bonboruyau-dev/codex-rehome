@@ -22,6 +22,7 @@ import {
   supportIdFromError,
   type CodexInventory,
   type ConversationEntry,
+  type CreatePackageRequest,
   type CreatePackageReport,
   type OptionalContentEntry,
 } from "../../lib/types";
@@ -64,12 +65,24 @@ export default function SendPage({
     () => inventory?.conversations.filter((conversation) => conversation.project_id === null) ?? [],
     [inventory],
   );
+  const unsafeProjects = useMemo(
+    () => inventory?.projects.filter(
+      (project) => project.source_available && projectContainsCodexHome(project.source_path, inventory.codex_home, inventory.source_os),
+    ) ?? [],
+    [inventory],
+  );
+  const safeProjects = useMemo(
+    () => inventory?.projects.filter(
+      (project) => project.source_available && !projectContainsCodexHome(project.source_path, inventory.codex_home, inventory.source_os),
+    ) ?? [],
+    [inventory],
+  );
 
   const hasContent =
     projects.size + conversations.size + skills.size + plugins.size + images.size > 0;
   const hasSelectableContent = Boolean(
     inventory &&
-      inventory.projects.filter((project) => project.source_available).length +
+      safeProjects.length +
         inventory.conversations.length +
         inventory.skills.length +
         inventory.plugins.length +
@@ -79,9 +92,7 @@ export default function SendPage({
   const allContentSelected = Boolean(
     inventory &&
       hasSelectableContent &&
-      inventory.projects
-        .filter((project) => project.source_available)
-        .every((project) => projects.has(project.project_id)) &&
+      safeProjects.every((project) => projects.has(project.project_id)) &&
       inventory.conversations.every((conversation) => conversations.has(conversation.task_id)) &&
       inventory.skills.every((skill) => skills.has(skill.content_id)) &&
       inventory.plugins.every((plugin) => plugins.has(plugin.content_id)) &&
@@ -134,9 +145,7 @@ export default function SendPage({
 
     setProjects(
       new Set(
-        inventory.projects
-          .filter((project) => project.source_available)
-          .map((project) => project.project_id),
+        safeProjects.map((project) => project.project_id),
       ),
     );
     setConversations(new Set(inventory.conversations.map((conversation) => conversation.task_id)));
@@ -145,20 +154,52 @@ export default function SendPage({
     setImages(new Set(inventory.generated_images.map((image) => image.content_id)));
   }
 
-  async function handleCreate() {
-    if (!inventory || !canCreate) return;
+  function fullSafeSelection(): CreatePackageRequest | null {
+    if (!inventory) return null;
+    return {
+      project_ids: safeProjects.map((project) => project.project_id),
+      conversation_ids: inventory.conversations.map((conversation) => conversation.task_id),
+      skill_ids: inventory.skills.map((skill) => skill.content_id),
+      plugin_ids: inventory.plugins.map((plugin) => plugin.content_id),
+      generated_image_ids: inventory.generated_images.map((image) => image.content_id),
+    };
+  }
+
+  function applySelection(selection: CreatePackageRequest) {
+    setProjects(new Set(selection.project_ids));
+    setConversations(new Set(selection.conversation_ids));
+    setSkills(new Set(selection.skill_ids));
+    setPlugins(new Set(selection.plugin_ids));
+    setImages(new Set(selection.generated_image_ids));
+  }
+
+  async function handleOneClickPackage() {
+    const selection = fullSafeSelection();
+    if (!selection) return;
+    applySelection(selection);
+    await handleCreate(selection);
+  }
+
+  async function handleCreate(selection?: CreatePackageRequest) {
+    if (!inventory || busy) return;
+    const requested = selection ?? {
+      project_ids: [...projects],
+      conversation_ids: [...conversations],
+      skill_ids: [...skills],
+      plugin_ids: [...plugins],
+      generated_image_ids: [...images],
+    };
+    if (
+      requested.project_ids.length + requested.conversation_ids.length + requested.skill_ids.length +
+        requested.plugin_ids.length + requested.generated_image_ids.length ===
+      0
+    ) return;
     setError(null);
     setSupportId(null);
     setBusy(true);
     onOperationStart();
     try {
-      const created = await createPackage({
-        project_ids: [...projects],
-        conversation_ids: [...conversations],
-        skill_ids: [...skills],
-        plugin_ids: [...plugins],
-        generated_image_ids: [...images],
-      });
+      const created = await createPackage(requested);
       if (created) {
         setReport(created);
         try {
@@ -193,20 +234,41 @@ export default function SendPage({
           <h1 ref={headingRef} tabIndex={-1}>{t("导出 Codex 数据")}</h1>
           <p className="page-description">{t("在原电脑选择要带走的项目、对话和其他 Codex 内容。")}</p>
         </div>
-        <label className="global-select-toggle">
-          <input
-            type="checkbox"
-            checked={allContentSelected}
-            onChange={toggleAllContent}
-            disabled={!hasSelectableContent}
-            aria-label={t("全选迁移内容")}
-          />
-          <span>
-            <strong>{t("全选迁移内容")}</strong>
-            <small>{t("项目、对话和 Codex 内容")}</small>
-          </span>
-        </label>
+        <div className="send-header-actions">
+          <label className="global-select-toggle">
+            <input
+              type="checkbox"
+              checked={allContentSelected}
+              onChange={toggleAllContent}
+              disabled={!hasSelectableContent || busy}
+              aria-label={t("全选迁移内容")}
+            />
+            <span>
+              <strong>{t("全选迁移内容")}</strong>
+              <small>{t("项目、对话和 Codex 内容")}</small>
+            </span>
+          </label>
+          <button
+            className="one-click-package-button"
+            type="button"
+            aria-label={t("一键打包全部")}
+            disabled={!hasSelectableContent || busy}
+            onClick={() => void handleOneClickPackage()}
+          >
+            {busy ? <LoaderCircle className="spin" aria-hidden="true" /> : <PackagePlus aria-hidden="true" />}
+            <span>
+              <strong>{t("一键打包全部")}</strong>
+              <small>{t("自动跳过不安全项目目录")}</small>
+            </span>
+          </button>
+        </div>
       </header>
+
+      {unsafeProjects.length > 0 && (
+        <p className="safe-package-notice" role="status">
+          {t("已跳过 {count} 个覆盖 Codex 数据目录的过宽项目；项目文件不打包，但其对话仍会迁移。", { count: unsafeProjects.length })}
+        </p>
+      )}
 
       <section className="workflow-section" aria-labelledby="send-projects-title">
         <div className="section-title-row">
@@ -221,6 +283,10 @@ export default function SendPage({
               path={formatDisplayPath(project.source_path)}
               fileCount={project.file_count}
               sourceAvailable={project.source_available}
+              projectSelectable={project.source_available && !unsafeProjects.some((item) => item.project_id === project.project_id)}
+              projectSafetyMessage={unsafeProjects.some((item) => item.project_id === project.project_id)
+                ? t("项目目录覆盖 Codex 数据目录；为避免递归打包和凭据暴露，只迁移下面的对话")
+                : null}
               conversations={project.conversations}
               projectSelected={projects.has(project.project_id)}
               expanded={expanded.has(project.project_id)}
@@ -327,6 +393,8 @@ interface ProjectChoiceProps {
   path: string;
   fileCount: number | null;
   sourceAvailable?: boolean;
+  projectSelectable?: boolean;
+  projectSafetyMessage?: string | null;
   conversations: ConversationEntry[];
   projectSelected: boolean;
   expanded: boolean;
@@ -337,20 +405,21 @@ interface ProjectChoiceProps {
   onSelectRecommended: () => void;
 }
 
-function ProjectChoice({ name, path, fileCount, sourceAvailable = true, conversations, projectSelected, expanded, selectedConversations, onToggleProject, onToggleExpanded, onToggleConversation, onSelectRecommended }: ProjectChoiceProps) {
+function ProjectChoice({ name, path, fileCount, sourceAvailable = true, projectSelectable = sourceAvailable, projectSafetyMessage = null, conversations, projectSelected, expanded, selectedConversations, onToggleProject, onToggleExpanded, onToggleConversation, onSelectRecommended }: ProjectChoiceProps) {
   const { locale, t } = useI18n();
   const subagents = conversations.filter((conversation) => conversation.classification).length;
   const mainConversations = conversations.length - subagents;
   return (
-    <div className={`project-choice${sourceAvailable ? "" : " project-choice-missing"}`}>
+    <div className={`project-choice${sourceAvailable ? "" : " project-choice-missing"}${projectSelectable ? "" : " project-choice-unsafe"}`}>
       <div className="project-choice-header">
         {onToggleProject ? (
           <label className="project-file-toggle">
-            <input type="checkbox" checked={projectSelected} onChange={onToggleProject} disabled={!sourceAvailable} aria-label={t("选择项目 {name}", { name })} />
+            <input type="checkbox" checked={projectSelected} onChange={onToggleProject} disabled={!projectSelectable} aria-label={t("选择项目 {name}", { name })} />
             <span className="project-copy">
               <strong>{name}</strong>
               <code>{path}</code>
               {!sourceAvailable && <small>{t("项目文件夹已不存在，仅可迁移下面的对话")}</small>}
+              {projectSafetyMessage && <small>{projectSafetyMessage}</small>}
             </span>
           </label>
         ) : (
@@ -388,6 +457,17 @@ function ProjectChoice({ name, path, fileCount, sourceAvailable = true, conversa
       )}
     </div>
   );
+}
+
+function projectContainsCodexHome(projectPath: string, codexHome: string, sourceOs: "windows" | "macos"): boolean {
+  const normalize = (value: string) => {
+    const withoutWindowsPrefix = value.startsWith("\\\\?\\") ? value.slice(4) : value;
+    const normalized = withoutWindowsPrefix.replaceAll("\\", "/").replace(/\/+$/, "");
+    return sourceOs === "windows" ? normalized.toLocaleLowerCase("en-US") : normalized;
+  };
+  const project = normalize(projectPath);
+  const home = normalize(codexHome);
+  return project.length > 0 && (home === project || home.startsWith(`${project}/`));
 }
 
 interface OptionalContentGroupProps {

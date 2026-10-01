@@ -44,6 +44,6 @@ fn every_custom_command_is_async() {
 
 #[test]
 fn restore_application_uses_only_the_opaque_core_plan_id() {
-    assert!(WORKFLOW_SOURCE.contains("apply_restore_by_id_observed("));
+    assert!(WORKFLOW_SOURCE.contains("apply_restore_by_id_with_progress("));
     assert!(!WORKFLOW_SOURCE.contains("pub async fn apply_restore(\n    plan:"));
 }

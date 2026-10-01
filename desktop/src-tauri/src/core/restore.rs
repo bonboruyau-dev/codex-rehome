@@ -21,7 +21,7 @@ use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fs, io, path::Path};
+use std::{collections::BTreeMap, fs, io, path::Path, time::Instant};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
@@ -33,7 +33,13 @@ pub fn apply_restore(
     options: RestoreOptions,
 ) -> Result<RestoreReport, RehomeError> {
     let plan = crate::core::plan_store::load_exact(&plan)?;
-    apply_server_plan(plan, options, register_project_with_detected_cli, |_, _| {})
+    apply_server_plan(
+        plan,
+        options,
+        register_project_with_detected_cli,
+        |_, _| {},
+        |_| {},
+    )
 }
 
 pub fn apply_restore_by_id(
@@ -41,7 +47,13 @@ pub fn apply_restore_by_id(
     options: RestoreOptions,
 ) -> Result<RestoreReport, RehomeError> {
     let plan = crate::core::plan_store::load(plan_id)?;
-    apply_server_plan(plan, options, register_project_with_detected_cli, |_, _| {})
+    apply_server_plan(
+        plan,
+        options,
+        register_project_with_detected_cli,
+        |_, _| {},
+        |_| {},
+    )
 }
 
 pub fn apply_restore_by_id_observed(
@@ -50,7 +62,41 @@ pub fn apply_restore_by_id_observed(
     observer: impl FnMut(Uuid, RecoveryStatus),
 ) -> Result<RestoreReport, RehomeError> {
     let plan = crate::core::plan_store::load(plan_id)?;
-    apply_server_plan(plan, options, register_project_with_detected_cli, observer)
+    apply_server_plan(
+        plan,
+        options,
+        register_project_with_detected_cli,
+        observer,
+        |_| {},
+    )
+}
+
+pub fn apply_restore_by_id_with_progress(
+    plan_id: Uuid,
+    options: RestoreOptions,
+    transaction_observer: impl FnMut(Uuid, RecoveryStatus),
+    progress_observer: impl FnMut(RestoreProgress),
+) -> Result<RestoreReport, RehomeError> {
+    let plan = crate::core::plan_store::load(plan_id)?;
+    apply_server_plan(
+        plan,
+        options,
+        register_project_with_detected_cli,
+        transaction_observer,
+        progress_observer,
+    )
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RestoreProgress {
+    pub transaction_id: Option<Uuid>,
+    pub phase: String,
+    pub completed_bytes: u64,
+    pub total_bytes: u64,
+    pub completed_files: u64,
+    pub total_files: u64,
+    pub elapsed_ms: u64,
 }
 
 pub fn apply_restore_with_registrar(
@@ -59,21 +105,24 @@ pub fn apply_restore_with_registrar(
     registrar: impl FnMut(SourceOs, &Path) -> RegistrationStatus,
 ) -> Result<RestoreReport, RehomeError> {
     let plan = crate::core::plan_store::load_exact(&plan)?;
-    apply_server_plan(plan, options, registrar, |_, _| {})
+    apply_server_plan(plan, options, registrar, |_, _| {}, |_| {})
 }
 
 fn apply_server_plan(
     plan: RestorePlan,
     options: RestoreOptions,
     mut registrar: impl FnMut(SourceOs, &Path) -> RegistrationStatus,
-    mut observer: impl FnMut(Uuid, RecoveryStatus),
+    mut transaction_observer: impl FnMut(Uuid, RecoveryStatus),
+    mut observer: impl FnMut(RestoreProgress),
 ) -> Result<RestoreReport, RehomeError> {
+    let started = Instant::now();
     if !options.codex_closed_confirmed {
         return Err(RehomeError::new(
             ErrorCode::CodexRunning,
             "restore requires confirmation that current Codex work is saved",
         ));
     }
+    emit_restore_progress(&mut observer, None, "checking_package", 0, 0, 0, 0, started);
     validate_plan(&plan)?;
     let verified = inspect_package_for_planning(&plan.package_path)?;
     validate_package_identity(&plan, &verified)?;
@@ -84,27 +133,87 @@ fn apply_server_plan(
         ));
     }
     validate_preserved_targets(&plan)?;
+    let copy_total_bytes = planned_copy_bytes(&plan, &verified);
+    let copy_total_files = planned_copy_file_count(&plan);
+    emit_restore_progress(
+        &mut observer,
+        None,
+        "preparing_backup",
+        0,
+        copy_total_bytes,
+        0,
+        copy_total_files,
+        started,
+    );
     let mut transaction = prepare_transaction(&plan, &options.backup_root)?;
-    observer(transaction.journal.transaction_id, RecoveryStatus::Prepared);
+    transaction_observer(transaction.journal.transaction_id, RecoveryStatus::Prepared);
+    emit_restore_progress(
+        &mut observer,
+        Some(transaction.journal.transaction_id),
+        "restoring_files",
+        0,
+        copy_total_bytes,
+        0,
+        copy_total_files,
+        started,
+    );
 
-    let result = apply_transaction(&plan, &options, &verified, &mut transaction, &mut registrar);
+    let result = apply_transaction(
+        &plan,
+        &options,
+        &verified,
+        &mut transaction,
+        &mut registrar,
+        &mut observer,
+        started,
+    );
     match result {
         Ok(report) => {
-            observer(report.transaction_id, RecoveryStatus::Committed);
+            transaction_observer(report.transaction_id, RecoveryStatus::Committed);
+            emit_restore_progress(
+                &mut observer,
+                Some(report.transaction_id),
+                "completed",
+                report.restored_bytes,
+                copy_total_bytes,
+                report.restored_files,
+                planned_copy_file_count(&plan),
+                started,
+            );
             Ok(report)
         }
         Err(error) => match rollback_prepared(&mut transaction) {
             Ok(_) => {
-                observer(
+                transaction_observer(
                     transaction.journal.transaction_id,
                     RecoveryStatus::RolledBack,
+                );
+                emit_restore_progress(
+                    &mut observer,
+                    Some(transaction.journal.transaction_id),
+                    "rolled_back",
+                    0,
+                    copy_total_bytes,
+                    0,
+                    planned_copy_file_count(&plan),
+                    started,
                 );
                 Err(error)
             }
             Err(rollback_error) => {
-                observer(
+                transaction_observer(
                     transaction.journal.transaction_id,
                     RecoveryStatus::RollbackFailed,
+                );
+                emit_restore_progress(
+                    &mut observer,
+                    Some(transaction.journal.transaction_id),
+                    "rollback_failed",
+                    0,
+                    copy_total_bytes,
+                    0,
+                    planned_copy_file_count(&plan),
+                    started,
                 );
                 Err(RehomeError::new(
                     ErrorCode::RollbackFailed,
@@ -146,11 +255,23 @@ fn apply_transaction(
     verified: &VerifiedPackage,
     transaction: &mut PreparedTransaction,
     registrar: &mut impl FnMut(SourceOs, &Path) -> RegistrationStatus,
+    observer: &mut impl FnMut(RestoreProgress),
+    started: Instant,
 ) -> Result<RestoreReport, RehomeError> {
     update_status(transaction, RecoveryStatus::Applying)?;
     let transaction_id = transaction.journal.transaction_id;
     let (mut restored_files, mut restored_bytes) =
-        apply_regular_files(plan, verified, transaction)?;
+        apply_regular_files(plan, verified, transaction, observer, started)?;
+    emit_restore_progress(
+        observer,
+        Some(transaction_id),
+        "updating_index",
+        restored_bytes,
+        planned_copy_bytes(plan, verified),
+        restored_files,
+        planned_copy_file_count(plan),
+        started,
+    );
     let bridge = apply_bridge_plan_for_transaction(plan, transaction_id, |target| {
         record_applied_mutation(transaction, target)
     })
@@ -174,6 +295,16 @@ fn apply_transaction(
     restored_bytes += changed_target_bytes(plan)?;
 
     update_status(transaction, RecoveryStatus::Verifying)?;
+    emit_restore_progress(
+        observer,
+        Some(transaction_id),
+        "verifying",
+        restored_bytes,
+        planned_copy_bytes(plan, verified),
+        restored_files,
+        planned_copy_file_count(plan),
+        started,
+    );
     let mut verification = verify_restore(plan, verified)?;
     if !data_verification_passed(&verification) {
         // Verification opens the restored SQLite database after the bridge has
@@ -278,6 +409,8 @@ fn apply_regular_files(
     plan: &RestorePlan,
     verified: &VerifiedPackage,
     transaction: &mut PreparedTransaction,
+    observer: &mut impl FnMut(RestoreProgress),
+    started: Instant,
 ) -> Result<(u64, u64), RehomeError> {
     let mut restored_files = 0_u64;
     let mut restored_bytes = 0_u64;
@@ -291,8 +424,20 @@ fn apply_regular_files(
         let mut staged = NamedTempFile::new().map_err(|error| {
             restore_failed(format!("could not stage restored payload: {error}"))
         })?;
+        let mut progress_writer = RestoreProgressWriter {
+            inner: staged.as_file_mut(),
+            transaction_id: transaction.journal.transaction_id,
+            completed_bytes: restored_bytes,
+            last_reported_bytes: restored_bytes,
+            total_bytes: planned_copy_bytes(plan, verified),
+            completed_files: restored_files,
+            total_files: planned_copy_file_count(plan),
+            observer,
+            started,
+        };
         let bytes =
-            payload_archive.write_payload(&operation.package_source, staged.as_file_mut())?;
+            payload_archive.write_payload(&operation.package_source, &mut progress_writer)?;
+        drop(progress_writer);
         staged.as_file().sync_all().map_err(|error| {
             restore_failed(format!("could not flush restored payload: {error}"))
         })?;
@@ -313,8 +458,108 @@ fn apply_regular_files(
         restored_bytes = restored_bytes
             .checked_add(bytes)
             .ok_or_else(|| restore_failed("restored byte count overflowed"))?;
+        emit_restore_progress(
+            observer,
+            Some(transaction.journal.transaction_id),
+            "restoring_files",
+            restored_bytes,
+            planned_copy_bytes(plan, verified),
+            restored_files,
+            planned_copy_file_count(plan),
+            started,
+        );
     }
     Ok((restored_files, restored_bytes))
+}
+
+struct RestoreProgressWriter<'a, 'b, W: io::Write> {
+    inner: &'a mut W,
+    transaction_id: Uuid,
+    completed_bytes: u64,
+    last_reported_bytes: u64,
+    total_bytes: u64,
+    completed_files: u64,
+    total_files: u64,
+    observer: &'b mut dyn FnMut(RestoreProgress),
+    started: Instant,
+}
+
+impl<W: io::Write> RestoreProgressWriter<'_, '_, W> {
+    fn report(&mut self, force: bool) {
+        if force
+            || self
+                .completed_bytes
+                .saturating_sub(self.last_reported_bytes)
+                >= 8 * 1024 * 1024
+        {
+            self.last_reported_bytes = self.completed_bytes;
+            (self.observer)(RestoreProgress {
+                transaction_id: Some(self.transaction_id),
+                phase: "restoring_files".to_owned(),
+                completed_bytes: self.completed_bytes,
+                total_bytes: self.total_bytes,
+                completed_files: self.completed_files,
+                total_files: self.total_files,
+                elapsed_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            });
+        }
+    }
+}
+
+impl<W: io::Write> io::Write for RestoreProgressWriter<'_, '_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.completed_bytes = self.completed_bytes.saturating_add(written as u64);
+        self.report(false);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn planned_copy_file_count(plan: &RestorePlan) -> u64 {
+    plan.operations
+        .iter()
+        .filter(|operation| {
+            matches!(operation.action, ChangeKind::Add | ChangeKind::Update)
+                && !is_bridge_operation(plan, &operation.package_source)
+        })
+        .count() as u64
+}
+
+fn planned_copy_bytes(plan: &RestorePlan, verified: &VerifiedPackage) -> u64 {
+    plan.operations
+        .iter()
+        .filter(|operation| {
+            matches!(operation.action, ChangeKind::Add | ChangeKind::Update)
+                && !is_bridge_operation(plan, &operation.package_source)
+        })
+        .filter_map(|operation| verified.payloads.get(&operation.package_source))
+        .map(|payload| payload.size_bytes)
+        .sum()
+}
+
+fn emit_restore_progress(
+    observer: &mut impl FnMut(RestoreProgress),
+    transaction_id: Option<Uuid>,
+    phase: &str,
+    completed_bytes: u64,
+    total_bytes: u64,
+    completed_files: u64,
+    total_files: u64,
+    started: Instant,
+) {
+    observer(RestoreProgress {
+        transaction_id,
+        phase: phase.to_owned(),
+        completed_bytes,
+        total_bytes,
+        completed_files,
+        total_files,
+        elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+    });
 }
 
 fn is_bridge_operation(plan: &RestorePlan, source: &str) -> bool {
@@ -462,6 +707,16 @@ fn verify_project_files(
         .filter(|operation| operation.target.starts_with(&plan.projects_root))
         .filter(|operation| operation.action != ChangeKind::Conflict)
     {
+        // A user can explicitly retain an existing project file when resolving
+        // a conflict. It is intentionally different from the package, so it
+        // must be verified against the planned local hash rather than the
+        // incoming payload hash.
+        if operation.action == ChangeKind::Preserve {
+            if !preserved_target_matches(operation)? {
+                return Ok(false);
+            }
+            continue;
+        }
         let expected = &verified
             .payloads
             .get(&operation.package_source)
