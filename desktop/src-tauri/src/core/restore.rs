@@ -122,7 +122,13 @@ fn apply_server_plan(
             "restore requires confirmation that current Codex work is saved",
         ));
     }
-    emit_restore_progress(&mut observer, None, "checking_package", 0, 0, 0, 0, started);
+    emit_restore_progress(
+        &mut observer,
+        None,
+        "checking_package",
+        (0, 0, 0, 0),
+        started,
+    );
     validate_plan(&plan)?;
     let verified = inspect_package_for_planning(&plan.package_path)?;
     validate_package_identity(&plan, &verified)?;
@@ -139,10 +145,7 @@ fn apply_server_plan(
         &mut observer,
         None,
         "preparing_backup",
-        0,
-        copy_total_bytes,
-        0,
-        copy_total_files,
+        (0, copy_total_bytes, 0, copy_total_files),
         started,
     );
     let mut transaction = prepare_transaction(&plan, &options.backup_root)?;
@@ -151,10 +154,7 @@ fn apply_server_plan(
         &mut observer,
         Some(transaction.journal.transaction_id),
         "restoring_files",
-        0,
-        copy_total_bytes,
-        0,
-        copy_total_files,
+        (0, copy_total_bytes, 0, copy_total_files),
         started,
     );
 
@@ -174,10 +174,12 @@ fn apply_server_plan(
                 &mut observer,
                 Some(report.transaction_id),
                 "completed",
-                report.restored_bytes,
-                copy_total_bytes,
-                report.restored_files,
-                planned_copy_file_count(&plan),
+                (
+                    report.restored_bytes,
+                    copy_total_bytes,
+                    report.restored_files,
+                    planned_copy_file_count(&plan),
+                ),
                 started,
             );
             Ok(report)
@@ -192,10 +194,7 @@ fn apply_server_plan(
                     &mut observer,
                     Some(transaction.journal.transaction_id),
                     "rolled_back",
-                    0,
-                    copy_total_bytes,
-                    0,
-                    planned_copy_file_count(&plan),
+                    (0, copy_total_bytes, 0, planned_copy_file_count(&plan)),
                     started,
                 );
                 Err(error)
@@ -209,10 +208,7 @@ fn apply_server_plan(
                     &mut observer,
                     Some(transaction.journal.transaction_id),
                     "rollback_failed",
-                    0,
-                    copy_total_bytes,
-                    0,
-                    planned_copy_file_count(&plan),
+                    (0, copy_total_bytes, 0, planned_copy_file_count(&plan)),
                     started,
                 );
                 Err(RehomeError::new(
@@ -266,10 +262,12 @@ fn apply_transaction(
         observer,
         Some(transaction_id),
         "updating_index",
-        restored_bytes,
-        planned_copy_bytes(plan, verified),
-        restored_files,
-        planned_copy_file_count(plan),
+        (
+            restored_bytes,
+            planned_copy_bytes(plan, verified),
+            restored_files,
+            planned_copy_file_count(plan),
+        ),
         started,
     );
     let bridge = apply_bridge_plan_for_transaction(plan, transaction_id, |target| {
@@ -299,10 +297,12 @@ fn apply_transaction(
         observer,
         Some(transaction_id),
         "verifying",
-        restored_bytes,
-        planned_copy_bytes(plan, verified),
-        restored_files,
-        planned_copy_file_count(plan),
+        (
+            restored_bytes,
+            planned_copy_bytes(plan, verified),
+            restored_files,
+            planned_copy_file_count(plan),
+        ),
         started,
     );
     let mut verification = verify_restore(plan, verified)?;
@@ -424,20 +424,20 @@ fn apply_regular_files(
         let mut staged = NamedTempFile::new().map_err(|error| {
             restore_failed(format!("could not stage restored payload: {error}"))
         })?;
-        let mut progress_writer = RestoreProgressWriter {
-            inner: staged.as_file_mut(),
-            transaction_id: transaction.journal.transaction_id,
-            completed_bytes: restored_bytes,
-            last_reported_bytes: restored_bytes,
-            total_bytes: planned_copy_bytes(plan, verified),
-            completed_files: restored_files,
-            total_files: planned_copy_file_count(plan),
-            observer,
-            started,
+        let bytes = {
+            let mut progress_writer = RestoreProgressWriter {
+                inner: staged.as_file_mut(),
+                transaction_id: transaction.journal.transaction_id,
+                completed_bytes: restored_bytes,
+                last_reported_bytes: restored_bytes,
+                total_bytes: planned_copy_bytes(plan, verified),
+                completed_files: restored_files,
+                total_files: planned_copy_file_count(plan),
+                observer,
+                started,
+            };
+            payload_archive.write_payload(&operation.package_source, &mut progress_writer)?
         };
-        let bytes =
-            payload_archive.write_payload(&operation.package_source, &mut progress_writer)?;
-        drop(progress_writer);
         staged.as_file().sync_all().map_err(|error| {
             restore_failed(format!("could not flush restored payload: {error}"))
         })?;
@@ -462,10 +462,12 @@ fn apply_regular_files(
             observer,
             Some(transaction.journal.transaction_id),
             "restoring_files",
-            restored_bytes,
-            planned_copy_bytes(plan, verified),
-            restored_files,
-            planned_copy_file_count(plan),
+            (
+                restored_bytes,
+                planned_copy_bytes(plan, verified),
+                restored_files,
+                planned_copy_file_count(plan),
+            ),
             started,
         );
     }
@@ -545,12 +547,10 @@ fn emit_restore_progress(
     observer: &mut impl FnMut(RestoreProgress),
     transaction_id: Option<Uuid>,
     phase: &str,
-    completed_bytes: u64,
-    total_bytes: u64,
-    completed_files: u64,
-    total_files: u64,
+    counts: (u64, u64, u64, u64),
     started: Instant,
 ) {
+    let (completed_bytes, total_bytes, completed_files, total_files) = counts;
     observer(RestoreProgress {
         transaction_id,
         phase: phase.to_owned(),
