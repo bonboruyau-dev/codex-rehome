@@ -978,8 +978,8 @@ fn data_verification_passed(report: &VerificationReport) -> bool {
 }
 
 fn hash_optional_file(path: &Path) -> Result<Option<String>, RehomeError> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(restore_failed(format!(
@@ -988,7 +988,14 @@ fn hash_optional_file(path: &Path) -> Result<Option<String>, RehomeError> {
             )))
         }
     };
-    Ok(Some(format!("{:x}", Sha256::digest(bytes))))
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher).map_err(|error| {
+        restore_failed(format!(
+            "could not hash restored file {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(format!("{:x}", hasher.finalize())))
 }
 
 #[cfg(windows)]
